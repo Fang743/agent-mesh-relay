@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Git pre-receive hook enforcing monotonic SQLite WAL fencing tokens.
+
+Rejects any push to `refs/shadow/<task_id>/epoch-<token>` when the carried
+epoch does not match the active, unexpired lease recorded in SQLite WAL.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+
+SHADOW_REF_RE = re.compile(r"^refs/shadow/([^/]+)/epoch-(\d+)$")
+
+
+def _resolve_db_path() -> Path | None:
+    env_path = os.environ.get("LEASE_DB_PATH")
+    if env_path:
+        return Path(env_path)
+    res = subprocess.run(
+        ["git", "config", "--get", "agentmesh.leasedb"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    cfg_path = res.stdout.strip()
+    return Path(cfg_path) if cfg_path else None
+
+
+def _current_time() -> float:
+    override = os.environ.get("LEASE_NOW_OVERRIDE")
+    return float(override) if override is not None else time.time()
+
+
+def _verify_ref(db_path: Path, task_id: str, token: int, now: float) -> tuple[bool, str]:
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+    try:
+        conn.execute("PRAGMA busy_timeout=5000;")
+        row = conn.execute(
+            "SELECT owner_node, fencing_token, lease_expires_at "
+            "FROM leases WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return False, f"no lease record for task '{task_id}'"
+
+    owner_node, active_token, expires_at = str(row[0]), int(row[1]), float(row[2])
+    if token != active_token:
+        return (
+            False,
+            f"stale fencing token {token} != active {active_token} "
+            f"(owner={owner_node}) for task '{task_id}'",
+        )
+    if expires_at <= now:
+        return (
+            False,
+            f"lease expired for task '{task_id}' (epoch={active_token})",
+        )
+    return True, "ok"
+
+
+def main() -> int:
+    updates = [line.strip() for line in sys.stdin if line.strip()]
+    if not updates:
+        return 0
+
+    shadow_checks: list[tuple[str, int, str]] = []
+    for line in updates:
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        _old_oid, _new_oid, refname = parts
+        match = SHADOW_REF_RE.match(refname)
+        if match:
+            shadow_checks.append((match.group(1), int(match.group(2)), refname))
+
+    if not shadow_checks:
+        return 0
+
+    db_path = _resolve_db_path()
+    if db_path is None or not db_path.exists():
+        print(
+            "REJECTED: LEASE_DB_PATH (or git config agentmesh.leasedb) is not configured",
+            file=sys.stderr,
+        )
+        return 1
+
+    now = _current_time()
+    for task_id, token, refname in shadow_checks:
+        ok, reason = _verify_ref(db_path, task_id, token, now)
+        if not ok:
+            print(f"REJECTED: {reason} (ref={refname})", file=sys.stderr)
+            return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
