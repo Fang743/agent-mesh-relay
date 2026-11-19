@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-mesh-relay"
+version = "0.1.0a1"
+description = "Distributed local multi-agent orchestrator with lease fencing tokens, shadow-ref handoffs, and lossless context ledgers."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
